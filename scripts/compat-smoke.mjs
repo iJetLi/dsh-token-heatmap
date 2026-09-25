@@ -87,13 +87,13 @@ const home = mkdtempSync(join(tmpdir(), "thm-compat-"));
 process.env.DSH_HOME = home;
 
 try {
-	// ---- stored-session enumeration across the two API generations --------
-	// The stored-session read interface changed once: the 0.1.2 line spells the
-	// snapshot list `listSnapshots()` and the log reader `readFrom(id, fromSeq)`,
-	// while 0.1.3+ uses `list()` plus `open(id,"read")`/`handle.read()`. Probing
-	// BOTH is correct and required — so this backend RECORDS access instead of
-	// trapping it. What must hold: a list()-only backend is tolerated, and with
-	// no sessions to read, the log reader is never invoked.
+	// ---- stored sessions are enumerated, never read ----------------------
+	// Both `sessionPersistence` spellings of the log reader return the WHOLE
+	// log, so this plugin enumerates ids only and never opens one; reading
+	// hundreds of stored sessions stalled the endpoint and starved every other
+	// plugin in the process. Probing the two snapshot-list spellings is still
+	// correct (they identify the backend generation), so this backend RECORDS
+	// access to those — but TRAPS the log readers, which must never be reached.
 	const logged = [];
 	const touched = [];
 	const ctxPersist = {
@@ -102,18 +102,23 @@ try {
 			if (name === "sessions") return { list: () => [] };
 			if (name === "sessionPersistence") {
 				return {
-					list: async () => [],
+					// Report one stored session: even with something to fold, the
+					// log must not be opened.
+					list: async () => [{ header: { id: "stored-s1" }, revision: "rev-1" }],
 					get listSnapshots() { touched.push("listSnapshots"); return void 0; },
-					get readFrom() { touched.push("readFrom"); return void 0; }
+					// TRAPS: reaching either log reader is the regression.
+					get open() { touched.push("open"); throw new Error("stored logs must not be read"); },
+					get readFrom() { touched.push("readFrom"); throw new Error("stored logs must not be read"); }
 				};
 			}
 			return void 0;
 		}
 	};
 	const persistResult = await collectUsage(ctxPersist);
-	check("list()-only backend is tolerated", persistResult !== void 0 && typeof persistResult.total === "number");
+	check("stored session present, fold still succeeds", persistResult !== void 0 && typeof persistResult.total === "number");
 	check("probes the 0.1.2 snapshot spelling", touched.includes("listSnapshots"), touched.join(",") || "(none)");
-	check("never reaches the log reader with nothing to read", !touched.includes("readFrom"), touched.join(",") || "(none)");
+	check("never opens a stored log, even with a session to fold",
+		!touched.includes("open") && !touched.includes("readFrom"), touched.join(",") || "(none)");
 	check("no warning on the happy path", logged.length === 0, logged.join(" | "));
 
 	// ---- branch A: 0.1.5-rc.3 host shape (register present) --------------

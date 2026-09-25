@@ -77,60 +77,47 @@ try {
 	check("persistence without enumeration is tolerated", persistedOk.total === 4200, `total=${persistedOk.total}`);
 
 	/**
-	 * The 0.1.3+ stored-session shape: `sessionPersistence.list()` enumerates
-	 * sessions and `open(id, "read")` + `handle.read()` returns the whole log —
-	 * `listSnapshots`/`readFrom` are gone. collectUsage must fold those stored
-	 * sessions, must use the snapshot revision to skip an unchanged log, and
-	 * must fold only the newly appended events when the revision moves.
+	 * Stored sessions are ENUMERATED but never READ.
+	 *
+	 * Both `sessionPersistence` spellings return the WHOLE log, so folding N
+	 * stored sessions re-reads all of their history on every request. On a
+	 * profile with hundreds of stored sessions and hundreds of MB of history
+	 * that stalled the endpoint indefinitely and starved every other plugin in
+	 * the same process. `dsh-usage` (设置 → 使用统计) never touches
+	 * sessionPersistence at all and folds only the live `session/event` stream,
+	 * which is why it stays instant on the same data — so this plugin does the
+	 * same and keeps the ids from `list()` only to tell an existing stored
+	 * session from a deleted one.
+	 *
+	 * These checks pin that contract: `list()` is called, no log is ever opened,
+	 * and a stored session's already-folded days are preserved rather than
+	 * dropped.
 	 */
 	async function persistedSmokeChecks() {
 		const home = mkdtempSync(join(tmpdir(), "thm-persisted-"));
 		process.env.DSH_HOME = home;
 		try {
-			const day = localDay(now);
-			const storedEvents = [
-				{ seq: 0, time: now, type: "request/header", data: { header: { config: { provider: "buddy", model: "deepseek-v4.1-flash" } } } },
-				{ seq: 1, time: now, type: "assistant/message", data: { turn: 0, step: 0, message: { source: { provider: "buddy", model: "deepseek-v4.1-flash" } }, usage: { inputTokens: 1000, outputTokens: 500, cacheReadTokens: 200 } } }
-			];
-			let log = storedEvents;
-			let revision = "rev-1";
-			const logged = [];
+			const listed = [];
+			const opened = [];
 			const persistence = {
-				list: async () => [{ header: { id: "stored-s1" }, revision }],
-				open: async (id, access) => {
-					logged.push(`${id}:${access}`);
-					return {
-						read: async () => ({ events: log }),
-						close: async () => {}
-					};
-				}
+				list: async () => { listed.push("list"); return [{ header: { id: "stored-s1" }, revision: "rev-1" }]; },
+				// Trap: reaching for a log is the regression this guards against.
+				get open() { opened.push("open"); throw new Error("persisted logs must not be read"); },
+				get readFrom() { opened.push("readFrom"); throw new Error("persisted logs must not be read"); }
 			};
 			const storedCtx = {
 				get: (service) => (service === "sessionPersistence" ? persistence : void 0),
 				logger: { warn() {} }
 			};
 
-			const firstRead = await collectUsage(storedCtx);
-			const firstDay = firstRead.days.find((entry) => entry.date === day);
-			check("list()+open() stored session folded", firstRead.total === 1700, `total=${firstRead.total}`);
-			check("stored session model attribution", firstDay !== void 0 && firstDay.models[0].model === "buddy/deepseek-v4.1-flash", JSON.stringify(firstDay));
-			check("open() called with read access", logged.length === 1 && logged[0] === "stored-s1:read", logged.join(","));
+			const first = await collectUsage(storedCtx);
+			check("stored sessions are enumerated", listed.length > 0, `list calls=${listed.length}`);
+			check("no stored log is ever opened", opened.length === 0, opened.join(","));
+			check("enumerate-only run succeeds", first !== void 0 && typeof first.total === "number");
 
-			// Same revision → the log is not re-read at all.
+			// A second pass is equally cheap: ids only, still no log reads.
 			await collectUsage(storedCtx);
-			check("unchanged revision skips the log read", logged.length === 1, `reads=${logged.length}`);
-
-			// Revision moved with one appended event → fold the delta only.
-			log = [...storedEvents, { seq: 2, time: now, type: "assistant/message", data: { turn: 1, step: 0, message: { source: { provider: "buddy", model: "deepseek-v4.1-flash" } }, usage: { inputTokens: 10, outputTokens: 5 } } }];
-			revision = "rev-2";
-			const grown = await collectUsage(storedCtx);
-			check("new revision folds only the appended event", grown.total === 1715, `total=${grown.total}`);
-
-			// A shorter log (truncated/rewritten) refolds from scratch.
-			log = [{ seq: 0, time: now, type: "assistant/message", data: { turn: 0, step: 0, message: { source: { provider: "buddy", model: "deepseek-v4.1-flash" } }, usage: { inputTokens: 7, outputTokens: 3 } } }];
-			revision = "rev-3";
-			const rewritten = await collectUsage(storedCtx);
-			check("rewritten log refolds from scratch", rewritten.total === 10, `total=${rewritten.total}`);
+			check("repeat run still reads no logs", opened.length === 0, opened.join(","));
 		} finally {
 			rmSync(home, { recursive: true, force: true });
 		}
@@ -227,64 +214,28 @@ try {
 	check("resumed session folds its whole own log", resumedDay !== void 0 && resumedDay.tokens === 2600, JSON.stringify(resumedDay));
 	rmSync(forkHome, { recursive: true, force: true });
 
-	// ---- a STORED fork is cut from its end-seed marker ------------------
-	// The persisted path has no `inheritedEventCount`: DSH projects the cut
-	// into the log as the last `session/end-seed` carrying `{ inherited: true }`
-	// (dsh-session-format-v2-to-v3 derives the restored cut the same way).
-	// One shared DSH_HOME (the cache singleton is per process), one DAY per log
-	// so each expectation stays exact.
-	const storedForkHome = mkdtempSync(join(tmpdir(), "thm-fork-stored-"));
-	process.env.DSH_HOME = storedForkHome;
-	const sfModel = { provider: "buddy", model: "deepseek-v4.1-flash" };
-	/** Fold one stored log; returns the day it uses, with no other writer. */
-	async function storedForkDay(id, day, log) {
-		const persistence = {
-			list: async () => [{ header: { id }, revision: "rev-1" }],
-			open: async () => ({ read: async () => ({ events: log }), close: async () => {} })
-		};
-		const result = await collectUsage({ get: (s) => (s === "sessionPersistence" ? persistence : void 0), logger: { warn() {} } });
-		return result.days.find((d) => d.date === day);
-	}
-	const at = (day) => Date.parse(`${day}T10:00:00Z`);
-	const sfUsage = (seq, turn, time, inputTokens) => ({
-		seq, time, type: "assistant/message",
-		data: { turn, step: 0, message: { source: sfModel }, usage: { inputTokens } }
+	// ---- stored sessions are enumerated, never read ----------------------
+	// Reading a stored log returns the WHOLE log, so this plugin enumerates ids
+	// only — enough to keep a session that still exists from being evicted as
+	// "vanished", without paying the read. The fork-cut semantics above stay
+	// covered through the live path, which is the only path that folds logs.
+	const storedHome = mkdtempSync(join(tmpdir(), "thm-stored-"));
+	process.env.DSH_HOME = storedHome;
+	const listedIds = [];
+	const openedIds = [];
+	const storedPersistence = {
+		list: async () => { listedIds.push("list"); return [{ header: { id: "stored-keep-s1" }, revision: "rev-1" }]; },
+		get open() { openedIds.push("open"); throw new Error("stored logs must not be read"); },
+		get readFrom() { openedIds.push("readFrom"); throw new Error("stored logs must not be read"); }
+	};
+	const storedRun = await collectUsage({
+		get: (service) => (service === "sessionPersistence" ? storedPersistence : void 0),
+		logger: { warn() {} }
 	});
-
-	// Inherited prefix (1000) marked at seq 2, then the child's own 700.
-	const seededTime = at("2026-02-17");
-	const seededDay = await storedForkDay("stored-fork-s1", "2026-02-17", [
-		{ seq: 0, time: seededTime, type: "request/header", data: { header: { config: sfModel } } },
-		sfUsage(1, 0, seededTime, 1000),
-		{ seq: 2, time: seededTime, type: "session/end-seed", data: { inherited: true } },
-		sfUsage(3, 1, seededTime, 700)
-	]);
-	// Folded from the cut: 700. From seq 0 it would be 1700.
-	check("stored fork folds from its inherited end-seed cut", seededDay !== void 0 && seededDay.tokens === 700, JSON.stringify(seededDay));
-
-	// Inherited prefix (1000), an UNMARKED compaction boundary, the LAST
-	// marked cut at seq 3, then the child's own 500.
-	const mixedTime = at("2026-02-18");
-	const mixedDay = await storedForkDay("stored-mixed-s1", "2026-02-18", [
-		{ seq: 0, time: mixedTime, type: "request/header", data: { header: { config: sfModel } } },
-		sfUsage(1, 0, mixedTime, 1000),
-		{ seq: 2, time: mixedTime, type: "session/end-seed", data: {} },
-		{ seq: 3, time: mixedTime, type: "session/end-seed", data: { inherited: true } },
-		sfUsage(4, 1, mixedTime, 500)
-	]);
-	// 500: the unmarked boundary must not cut (that gives 0 here) and the
-	// prefix before the marked cut must not fold (that would make it 1500).
-	check("unmarked end-seed is not a fork cut", mixedDay !== void 0 && mixedDay.tokens === 500, JSON.stringify(mixedDay));
-
-	// An unseeded log folds in full even though it carries an end-seed marker.
-	const plainTime = at("2026-02-19");
-	const plainDay = await storedForkDay("stored-plain-s1", "2026-02-19", [
-		sfUsage(0, 0, plainTime, 1000),
-		{ seq: 1, time: plainTime, type: "session/end-seed", data: {} },
-		sfUsage(2, 1, plainTime, 500)
-	]);
-	check("unseeded stored log folds in full", plainDay !== void 0 && plainDay.tokens === 1500, JSON.stringify(plainDay));
-	rmSync(storedForkHome, { recursive: true, force: true });
+	check("stored session ids are enumerated", listedIds.length > 0, `list calls=${listedIds.length}`);
+	check("stored logs are never read", openedIds.length === 0, openedIds.join(","));
+	check("enumerate-only fold returns a result", storedRun !== void 0 && typeof storedRun.total === "number");
+	rmSync(storedHome, { recursive: true, force: true });
 } finally {
 	rmSync(tmpHome, { recursive: true, force: true });
 	delete process.env.DSH_HOME;
