@@ -12,13 +12,17 @@ assert.equal(typeof SETTINGS_NAMESPACE, "string");
 assert.equal(SETTINGS_NAMESPACE, "token-heatmap", "namespace must be token-heatmap");
 
 // Empty section → schema defaults.
-assert.deepEqual(TokenHeatmapSettingsSchema({}), { enabled: true, colorScheme: "green" });
+assert.deepEqual(TokenHeatmapSettingsSchema({}), { colorScheme: "green", defaultView: "year" });
 
 // Explicit values pass through.
-assert.deepEqual(TokenHeatmapSettingsSchema({ enabled: false, colorScheme: "blue" }), { enabled: false, colorScheme: "blue" });
+assert.deepEqual(TokenHeatmapSettingsSchema({ colorScheme: "blue", defaultView: "month" }), { colorScheme: "blue", defaultView: "month" });
 
-// Non-boolean enabled is rejected → the Host refuses the write.
-assert.throws(() => TokenHeatmapSettingsSchema({ enabled: "yes" }), /enabled/, "non-boolean enabled must throw");
+// The 0.1.x display switch is not part of the schema any more. Schemastery
+// passes an undeclared key through untouched, so a stale `enabled` survives in
+// the resolved section — which is fine: nothing reads it (serveConfig reports a
+// constant true, and the client no longer gates on it).
+assert.deepEqual(TokenHeatmapSettingsSchema({ enabled: false }), { enabled: false, colorScheme: "green", defaultView: "year" }, "retired enabled is inert");
+assert.equal(TokenHeatmapSettingsSchema({ enabled: false }).colorScheme, "green", "retired enabled must not affect the resolved defaults");
 
 // Blank scheme is rejected (min length 1).
 assert.throws(() => TokenHeatmapSettingsSchema({ colorScheme: "" }), /colorScheme/, "blank scheme must throw");
@@ -29,7 +33,13 @@ assert.throws(() => TokenHeatmapSettingsSchema({ colorScheme: "x".repeat(40) }),
 // Unknown-but-well-formed scheme is preserved verbatim, so a newer client's
 // palette survives (the client falls back to green while rendering).
 const resolved = TokenHeatmapSettingsSchema({ colorScheme: "rainbow" });
-assert.deepEqual(resolved, { enabled: true, colorScheme: "rainbow" }, "unknown scheme must be preserved");
+assert.deepEqual(resolved, { colorScheme: "rainbow", defaultView: "year" }, "unknown scheme must be preserved");
+
+// The view mode IS enumerated (unlike the scheme): an unknown mode has no
+// renderer to fall back to in the client, so the Host refuses the write.
+assert.throws(() => TokenHeatmapSettingsSchema({ defaultView: "week" }), /defaultView/, "unknown view mode must throw");
+assert.equal(TokenHeatmapSettingsSchema({ defaultView: "month" }).defaultView, "month");
+assert.equal(TokenHeatmapSettingsSchema({}).defaultView, "year", "view default must be year");
 
 // ---- Cordis Config export (DSH 0.1.7 projects the settings form from it) ----
 // It MUST be exported for 0.1.7 (SettingsForms reads entry.fiber.runtime.Config),
@@ -38,14 +48,14 @@ assert.deepEqual(resolved, { enabled: true, colorScheme: "rainbow" }, "unknown s
 assert.equal(typeof Config, "function", "Config schema must be exported");
 // `toJSON()` emits a flat reference table ({uid, refs}), so walk the live
 // schema's own `dict` for the field set rather than dereferencing refs.
-assert.deepEqual(Object.keys(Config.dict).sort(), ["colorScheme", "enabled"], "Config must expose exactly the two settings fields");
+assert.deepEqual(Object.keys(Config.dict).sort(), ["colorScheme", "defaultView"], "Config must expose exactly the two settings fields");
 assert.equal(typeof Config.toJSON, "function", "Config must serialize for the settings wire");
 assert.ok(Config.toJSON().refs, "serialized Config must carry the reference table the settings form consumes");
 
 // Both fields must be marked volatile — 0.1.7's volatileForm() keeps only
 // meta.volatile nodes, so an unmarked field never reaches the settings form
 // and `settings.update()` refuses with "has no volatile fields".
-assert.equal(Config.dict.enabled.meta.volatile, true, "enabled must be volatile");
+assert.equal(Config.dict.defaultView.meta.volatile, true, "defaultView must be volatile");
 assert.equal(Config.dict.colorScheme.meta.volatile, true, "colorScheme must be volatile");
 
 // Defaults resolve so a profile entry with no config: block still serves a
@@ -57,10 +67,10 @@ assert.equal(Config.dict.colorScheme.meta.volatile, true, "colorScheme must be v
 // shapes so this smoke runs against either schemastery.
 const unwrap = (value) => value !== null && typeof value === "object" && typeof value.get === "function" ? value.get() : value;
 const defaults = Config({});
-assert.equal(unwrap(defaults.enabled), true, "enabled default");
 assert.equal(unwrap(defaults.colorScheme), "green", "colorScheme default");
-const explicit = Config({ enabled: false, colorScheme: "teal" });
-assert.equal(unwrap(explicit.enabled), false, "explicit enabled");
+assert.equal(unwrap(defaults.defaultView), "year", "defaultView default");
+const explicit = Config({ colorScheme: "teal", defaultView: "month" });
 assert.equal(unwrap(explicit.colorScheme), "teal", "explicit scheme");
+assert.equal(unwrap(explicit.defaultView), "month", "explicit view");
 
 console.log("settings schema contract smoke passed");

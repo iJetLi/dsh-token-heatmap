@@ -10,7 +10,7 @@
  * Runs against a throwaway DSH_HOME so the real cache file is untouched.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { collectUsage, apply } from "../lib/index.js";
@@ -44,7 +44,7 @@ const check = (name, ok, detail = "") => {
 
 try {
 	// rc.1 session shape: seq + eventAt, no .events array; persistence absent
-	// (rc.1 exposes no list/listSnapshots enumeration).
+	// on this context (the enumeration/read shapes are covered below).
 	const rc1Session = { id: "rc1-s1", seq: events.length, eventAt: (n) => events[n] };
 	const rc1Ctx = makeCtx({ list: () => [rc1Session] });
 
@@ -67,55 +67,76 @@ try {
 	check("legacy .events shape still folds", legacy.total === 4200, `total=${legacy.total}`);
 
 	// A sessionPersistence WITHOUT enumeration must not break the call either,
-	// and the previously folded sessions stay in the cache (not dropped).
-	// `stat` is a real SessionPersistence method; `list` is deliberately absent
-	// here so the no-enumeration path is the one under test. (Supplying an
-	// empty `list()` would instead make the enumeration authoritative and the
-	// eviction loop would drop the earlier legacy session, as it should.)
+	// and the unenumerable persisted sessions stay in the cache (not dropped).
 	const rc1WithPersistence = {
 		get: (name) => name === "sessions" ? { list: () => [rc1Session] }
-			// SessionPersistence exposes create/open/flush/stat/list only —
-			// never listSnapshots()/readFrom(); the plugin must not need them.
-			: name === "sessionPersistence" ? { stat: async () => void 0 } : void 0,
+			: name === "sessionPersistence" ? { readFrom: async () => ({ events: [] }) } : void 0,
 		logger: { warn() {} }
 	};
 	const persistedOk = await collectUsage(rc1WithPersistence);
 	check("persistence without enumeration is tolerated", persistedOk.total === 4200, `total=${persistedOk.total}`);
 
-	// ---- ledger optional enhancement -----------------------------------
-	// When the @linxin666/dsh-usage ledger exists, collectUsage serves it as
-	// an optional enhancement (complete + real-time) over the session/event
-	// fold, recovering full history even when persisted sessions cannot be
-	// enumerated (rc.1). The file only exists when that plugin is installed.
-	const ledgerHome = mkdtempSync(join(tmpdir(), "thm-ledger-"));
-	process.env.DSH_HOME = ledgerHome;
-	mkdirSync(join(ledgerHome, "dsh-usage"), { recursive: true });
-	writeFileSync(
-		join(ledgerHome, "dsh-usage", "usage-ledger.json"),
-		JSON.stringify({
-			version: 1,
-			days: {
-				"2026-01-15": {
-					"buddy": {
-						"deepseek-v4.1-flash": { inputTokens: 1000, outputTokens: 500, cacheReadTokens: 200, cacheWriteTokens: 0, reasoningTokens: 0, calls: 1, cost: 0 }
-					}
+	/**
+	 * The 0.1.3+ stored-session shape: `sessionPersistence.list()` enumerates
+	 * sessions and `open(id, "read")` + `handle.read()` returns the whole log —
+	 * `listSnapshots`/`readFrom` are gone. collectUsage must fold those stored
+	 * sessions, must use the snapshot revision to skip an unchanged log, and
+	 * must fold only the newly appended events when the revision moves.
+	 */
+	async function persistedSmokeChecks() {
+		const home = mkdtempSync(join(tmpdir(), "thm-persisted-"));
+		process.env.DSH_HOME = home;
+		try {
+			const day = localDay(now);
+			const storedEvents = [
+				{ seq: 0, time: now, type: "request/header", data: { header: { config: { provider: "buddy", model: "deepseek-v4.1-flash" } } } },
+				{ seq: 1, time: now, type: "assistant/message", data: { turn: 0, step: 0, message: { source: { provider: "buddy", model: "deepseek-v4.1-flash" } }, usage: { inputTokens: 1000, outputTokens: 500, cacheReadTokens: 200 } } }
+			];
+			let log = storedEvents;
+			let revision = "rev-1";
+			const logged = [];
+			const persistence = {
+				list: async () => [{ header: { id: "stored-s1" }, revision }],
+				open: async (id, access) => {
+					logged.push(`${id}:${access}`);
+					return {
+						read: async () => ({ events: log }),
+						close: async () => {}
+					};
 				}
-			}
-		}),
-		"utf8"
-	);
-	const ledgerResult = await collectUsage({ get: () => void 0, logger: { warn() {} } });
-	const ledgerDay = ledgerResult.days.find((entry) => entry.date === "2026-01-15");
-	check("ledger optional enhancement served", ledgerResult.total === 1700, `total=${ledgerResult.total}`);
-	check("ledger day total", ledgerDay !== void 0 && ledgerDay.tokens === 1700, JSON.stringify(ledgerDay));
-	check("ledger model attribution", ledgerDay?.models?.[0]?.model === "buddy/deepseek-v4.1-flash");
-	// Without a ledger, collectUsage falls back to the session-event fold and
-	// does not serve the (now-deleted) ledger data.
-	rmSync(join(ledgerHome, "dsh-usage", "usage-ledger.json"), { force: true });
-	const fallbackResult = await collectUsage({ get: () => void 0, logger: { warn() {} } });
-	const fallbackHasLedgerDay = fallbackResult.days.some((entry) => entry.date === "2026-01-15");
-	check("no ledger → fallback does not serve ledger data", !fallbackHasLedgerDay, `days=${fallbackResult.days.map((d) => d.date).join(",")}`);
-	rmSync(ledgerHome, { recursive: true, force: true });
+			};
+			const storedCtx = {
+				get: (service) => (service === "sessionPersistence" ? persistence : void 0),
+				logger: { warn() {} }
+			};
+
+			const firstRead = await collectUsage(storedCtx);
+			const firstDay = firstRead.days.find((entry) => entry.date === day);
+			check("list()+open() stored session folded", firstRead.total === 1700, `total=${firstRead.total}`);
+			check("stored session model attribution", firstDay !== void 0 && firstDay.models[0].model === "buddy/deepseek-v4.1-flash", JSON.stringify(firstDay));
+			check("open() called with read access", logged.length === 1 && logged[0] === "stored-s1:read", logged.join(","));
+
+			// Same revision → the log is not re-read at all.
+			await collectUsage(storedCtx);
+			check("unchanged revision skips the log read", logged.length === 1, `reads=${logged.length}`);
+
+			// Revision moved with one appended event → fold the delta only.
+			log = [...storedEvents, { seq: 2, time: now, type: "assistant/message", data: { turn: 1, step: 0, message: { source: { provider: "buddy", model: "deepseek-v4.1-flash" } }, usage: { inputTokens: 10, outputTokens: 5 } } }];
+			revision = "rev-2";
+			const grown = await collectUsage(storedCtx);
+			check("new revision folds only the appended event", grown.total === 1715, `total=${grown.total}`);
+
+			// A shorter log (truncated/rewritten) refolds from scratch.
+			log = [{ seq: 0, time: now, type: "assistant/message", data: { turn: 0, step: 0, message: { source: { provider: "buddy", model: "deepseek-v4.1-flash" } }, usage: { inputTokens: 7, outputTokens: 3 } } }];
+			revision = "rev-3";
+			const rewritten = await collectUsage(storedCtx);
+			check("rewritten log refolds from scratch", rewritten.total === 10, `total=${rewritten.total}`);
+		} finally {
+			rmSync(home, { recursive: true, force: true });
+		}
+	}
+
+	await persistedSmokeChecks();
 
 	// ---- session/event real-time fold ---------------------------------
 	// apply() registers a session/event listener that folds each event into
@@ -144,28 +165,28 @@ try {
 	check("session/event model attribution", seDay?.models?.[0]?.model === "buddy/deepseek-v4.1-flash");
 	rmSync(seHome, { recursive: true, force: true });
 
-	// ---- fork sessions must not double count ---------------------------
-	// A forked session (header.isSeeded) inherits its parent's event prefix.
-	// Those events are the PARENT's usage and are folded when the parent is
-	// folded, so the child must start at inheritedEventCount or the parent's
-	// tokens are counted twice (the 2026-09-14 1.3B-vs-0.83B regression).
+	// ---- forked sessions fold from their fork cut ----------------------
+	// A forked session (header.isSeeded) opens with a copy of its PARENT's
+	// events; `inheritedEventCount` is the exact cut. That prefix is folded
+	// when the parent is folded, so a child folding from seq 0 counts the same
+	// tokens twice (measured 2026-09-14: 13.15e8 instead of 8.34e8).
 	const forkHome = mkdtempSync(join(tmpdir(), "thm-fork-"));
 	process.env.DSH_HOME = forkHome;
 	const fTime = Date.UTC(2026, 1, 3, 10, 0, 0);
-	const model = { provider: "buddy", model: "deepseek-v4.1-flash" };
+	const fModel = { provider: "buddy", model: "deepseek-v4.1-flash" };
 	const usageEvent = (seq, turn, inputTokens) => ({
 		seq, time: fTime, type: "assistant/message",
-		data: { turn, step: 0, message: { source: model }, usage: { inputTokens } }
+		data: { turn, step: 0, message: { source: fModel }, usage: { inputTokens } }
 	});
 	// Parent: two own usage samples (1500 total).
 	const parentEvents = [
-		{ seq: 0, time: fTime, type: "request/header", data: { header: { config: model } } },
+		{ seq: 0, time: fTime, type: "request/header", data: { header: { config: fModel } } },
 		usageEvent(1, 0, 1000),
 		usageEvent(2, 1, 500)
 	];
 	const parent = { id: "fork-parent", seq: parentEvents.length, eventAt: (n) => parentEvents[n] };
 	// Child: inherits the parent's prefix (seq 0..1), marks the cut at seq 2,
-	// then adds ONE own sample (700). Only the own sample may be folded.
+	// then adds ONE own sample (700) — only that sample may be folded.
 	const childEvents = [
 		parentEvents[0],
 		parentEvents[1],
@@ -179,27 +200,91 @@ try {
 		seq: childEvents.length,
 		eventAt: (n) => childEvents[n]
 	};
-	// NOTE: assertions are per-day, not `result.total` — loadCache() is a
-	// module-level singleton, so earlier sections in this file share one cache.
-	// The day totals are what the regression is about and they stay isolated.
-	const forkResult = await collectUsage(makeCtx({ list: () => [parent, child] }));
+	const forkCtx = makeCtx({ list: () => [parent, child] });
+	const forkResult = await collectUsage(forkCtx);
 	const forkDay = forkResult.days.find((d) => d.date === "2026-02-03");
-	// parent own 1500 + child own 700; a broken fold re-adds the inherited
-	// prefix and reports 3700 here.
+	// parent own 1500 + child own 700; a fold from seq 0 reports 3700 here.
 	check("fork child does not re-fold the inherited prefix", forkDay !== void 0 && forkDay.tokens === 2200, JSON.stringify(forkDay));
+	check("fork child keeps model attribution", forkDay?.models?.[0]?.model === "buddy/deepseek-v4.1-flash");
+	// A second pass must not add the prefix back on top of the folded days.
+	const forkAgain = await collectUsage(forkCtx);
+	const forkDayAgain = forkAgain.days.find((d) => d.date === "2026-02-03");
+	check("fork child stays stable across passes", forkDayAgain !== void 0 && forkDayAgain.tokens === 2200, JSON.stringify(forkDayAgain));
 
 	// A RESUMED session is NOT a fork: its constructor seed is its own stored
-	// history, so all of it must fold (isSeeded false ⇒ no cut).
+	// history, so the whole log folds (isSeeded false → no cut). The unmarked
+	// `session/end-seed` here is a compaction boundary and must not be read as
+	// a fork cut.
 	const resumedEvents = [
-		{ seq: 0, time: fTime, type: "request/header", data: { header: { config: model } } },
+		{ seq: 0, time: fTime, type: "request/header", data: { header: { config: fModel } } },
 		{ seq: 1, time: fTime, type: "session/end-seed", data: {} },
-		{ seq: 2, time: fTime, type: "assistant/message", data: { turn: 0, step: 0, message: { source: model }, usage: { inputTokens: 400 } } }
+		usageEvent(2, 0, 400)
 	];
 	const resumed = { id: "resumed-s1", header: { isSeeded: false }, seq: resumedEvents.length, eventAt: (n) => resumedEvents[n] };
 	const resumedResult = await collectUsage(makeCtx({ list: () => [resumed] }));
 	const resumedDay = resumedResult.days.find((d) => d.date === "2026-02-03");
+	// 2200 (fork) + this session's own 400; a bogus cut would drop it to 2200.
 	check("resumed session folds its whole own log", resumedDay !== void 0 && resumedDay.tokens === 2600, JSON.stringify(resumedDay));
 	rmSync(forkHome, { recursive: true, force: true });
+
+	// ---- a STORED fork is cut from its end-seed marker ------------------
+	// The persisted path has no `inheritedEventCount`: DSH projects the cut
+	// into the log as the last `session/end-seed` carrying `{ inherited: true }`
+	// (dsh-session-format-v2-to-v3 derives the restored cut the same way).
+	// One shared DSH_HOME (the cache singleton is per process), one DAY per log
+	// so each expectation stays exact.
+	const storedForkHome = mkdtempSync(join(tmpdir(), "thm-fork-stored-"));
+	process.env.DSH_HOME = storedForkHome;
+	const sfModel = { provider: "buddy", model: "deepseek-v4.1-flash" };
+	/** Fold one stored log; returns the day it uses, with no other writer. */
+	async function storedForkDay(id, day, log) {
+		const persistence = {
+			list: async () => [{ header: { id }, revision: "rev-1" }],
+			open: async () => ({ read: async () => ({ events: log }), close: async () => {} })
+		};
+		const result = await collectUsage({ get: (s) => (s === "sessionPersistence" ? persistence : void 0), logger: { warn() {} } });
+		return result.days.find((d) => d.date === day);
+	}
+	const at = (day) => Date.parse(`${day}T10:00:00Z`);
+	const sfUsage = (seq, turn, time, inputTokens) => ({
+		seq, time, type: "assistant/message",
+		data: { turn, step: 0, message: { source: sfModel }, usage: { inputTokens } }
+	});
+
+	// Inherited prefix (1000) marked at seq 2, then the child's own 700.
+	const seededTime = at("2026-02-17");
+	const seededDay = await storedForkDay("stored-fork-s1", "2026-02-17", [
+		{ seq: 0, time: seededTime, type: "request/header", data: { header: { config: sfModel } } },
+		sfUsage(1, 0, seededTime, 1000),
+		{ seq: 2, time: seededTime, type: "session/end-seed", data: { inherited: true } },
+		sfUsage(3, 1, seededTime, 700)
+	]);
+	// Folded from the cut: 700. From seq 0 it would be 1700.
+	check("stored fork folds from its inherited end-seed cut", seededDay !== void 0 && seededDay.tokens === 700, JSON.stringify(seededDay));
+
+	// Inherited prefix (1000), an UNMARKED compaction boundary, the LAST
+	// marked cut at seq 3, then the child's own 500.
+	const mixedTime = at("2026-02-18");
+	const mixedDay = await storedForkDay("stored-mixed-s1", "2026-02-18", [
+		{ seq: 0, time: mixedTime, type: "request/header", data: { header: { config: sfModel } } },
+		sfUsage(1, 0, mixedTime, 1000),
+		{ seq: 2, time: mixedTime, type: "session/end-seed", data: {} },
+		{ seq: 3, time: mixedTime, type: "session/end-seed", data: { inherited: true } },
+		sfUsage(4, 1, mixedTime, 500)
+	]);
+	// 500: the unmarked boundary must not cut (that gives 0 here) and the
+	// prefix before the marked cut must not fold (that would make it 1500).
+	check("unmarked end-seed is not a fork cut", mixedDay !== void 0 && mixedDay.tokens === 500, JSON.stringify(mixedDay));
+
+	// An unseeded log folds in full even though it carries an end-seed marker.
+	const plainTime = at("2026-02-19");
+	const plainDay = await storedForkDay("stored-plain-s1", "2026-02-19", [
+		sfUsage(0, 0, plainTime, 1000),
+		{ seq: 1, time: plainTime, type: "session/end-seed", data: {} },
+		sfUsage(2, 1, plainTime, 500)
+	]);
+	check("unseeded stored log folds in full", plainDay !== void 0 && plainDay.tokens === 1500, JSON.stringify(plainDay));
+	rmSync(storedForkHome, { recursive: true, force: true });
 } finally {
 	rmSync(tmpHome, { recursive: true, force: true });
 	delete process.env.DSH_HOME;
