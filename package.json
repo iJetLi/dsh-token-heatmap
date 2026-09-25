@@ -1,6 +1,6 @@
 {
   "name": "@kidli1412/dsh-token-heatmap",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "DSH web plugin: GitHub-style daily token-usage heatmap on the new-session screen with a selectable calendar-year view, green/blue color schemes and a display switch (设置 → 插件 → 插件配置), plus today / this-month / all-time totals.",
   "type": "module",
   "main": "lib/index.js",
@@ -46,15 +46,14 @@
     },
     "compatibility": {
       "dshReleases": {
-        "0.1.2-alpha.4": "compatible",
-        "0.1.2-alpha.5": "compatible",
-        "0.1.2-rc.1": "compatible"
+        "0.1.5-rc.3": "compatible",
+        "0.1.7-rc.2": "compatible"
       }
     }
   },
   "scripts": {
     "check": "node --check lib/usage.js && node --check lib/config.js && node --check lib/index.js && node --check lib/client.js",
-    "test": "node scripts/smoke.mjs && node scripts/settings-smoke.mjs && node scripts/rc1-session-smoke.mjs",
+    "test": "node scripts/smoke.mjs && node scripts/settings-smoke.mjs && node scripts/rc1-session-smoke.mjs && node scripts/compat-smoke.mjs",
     "prepublishOnly": "npm run check && npm test"
   },
   "license": "MIT",

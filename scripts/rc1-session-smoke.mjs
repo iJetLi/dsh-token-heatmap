@@ -67,10 +67,16 @@ try {
 	check("legacy .events shape still folds", legacy.total === 4200, `total=${legacy.total}`);
 
 	// A sessionPersistence WITHOUT enumeration must not break the call either,
-	// and the unenumerable persisted sessions stay in the cache (not dropped).
+	// and the previously folded sessions stay in the cache (not dropped).
+	// `stat` is a real SessionPersistence method; `list` is deliberately absent
+	// here so the no-enumeration path is the one under test. (Supplying an
+	// empty `list()` would instead make the enumeration authoritative and the
+	// eviction loop would drop the earlier legacy session, as it should.)
 	const rc1WithPersistence = {
 		get: (name) => name === "sessions" ? { list: () => [rc1Session] }
-			: name === "sessionPersistence" ? { readFrom: async () => ({ events: [] }) } : void 0,
+			// SessionPersistence exposes create/open/flush/stat/list only —
+			// never listSnapshots()/readFrom(); the plugin must not need them.
+			: name === "sessionPersistence" ? { stat: async () => void 0 } : void 0,
 		logger: { warn() {} }
 	};
 	const persistedOk = await collectUsage(rc1WithPersistence);

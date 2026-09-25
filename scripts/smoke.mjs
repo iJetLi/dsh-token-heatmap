@@ -190,6 +190,26 @@ await store.set({ colorScheme: "   " });
 check("blank scheme sanitized to default", mock.getSnapshot().value.colorScheme === "green");
 store.dispose();
 
+// reload() must not depend on a scope.load() method — neither train's scope
+// has one (the refresh lives on the internal describe mirror). The card's
+// retry button calls it whenever status turns 'unavailable'.
+const reloadScope = createMockScope({ status: "unavailable", value: void 0, writable: false, mode: "host" });
+const reloadStore = exports.createConfigStore(reloadScope);
+let notified = 0;
+reloadStore.subscribe(() => { notified += 1; });
+check("store starts unavailable", reloadStore.getSnapshot().status === "unavailable");
+let reloadThrew = false;
+try {
+	reloadStore.reload();
+} catch (error) {
+	reloadThrew = true;
+	console.log(`         reload threw: ${error.message}`);
+}
+check("reload() does not throw", !reloadThrew);
+reloadScope.publish({ status: "ready", value: { enabled: true, colorScheme: "teal" }, writable: true, mode: "host" });
+check("reload() notifies subscribers", notified > 0, `notified=${notified}`);
+reloadStore.dispose();
+
 // Absolute color thresholds (per-day tokens).
 check("levelOf absolute buckets", exports.levelOf(0) === 0 && exports.levelOf(5e5) === 1 && exports.levelOf(5e6) === 2 && exports.levelOf(61e6) === 3 && exports.levelOf(2e8) === 4, `got ${exports.levelOf(61e6)}`);
 

@@ -189,3 +189,39 @@ if (canEnumeratePersisted) {
 - 两版配置**存储位置不同**：0.1.5 → `<DSH_HOME>/settings.yaml`；0.1.7 → profile `cordis.patch.yml` 的 entry `config:` 字段。0.1.5 → 0.1.7 升级时由 DSH 的 `importLegacyDocument` 自动搬运（前提是 entry id 为 `token-heatmap`，插件自带 patch 正是该 id）；反向降级需手动搬。
 - 0.1.2 版本线不再声明 —— 未在本次验证范围内。
 - persisted 会话的历史增量刷新仍不可用（原能力在 rc.1 后已由官方移除，本设计只清理死代码、不恢复该能力）。
+
+## 7. 实现期变更（2026-09-25）
+
+### 7.1 配置卡落点改为 `settings.plugins.tab`
+
+原设计（第 4.2 节）让两条版本分支各注册版本专属插槽：0.1.5 用 `settings.plugin.item`，0.1.7 用 `plugins.bundle.config`。**实机验证推翻了这一点**：
+
+- profile 的 composition **包含** `ui-plugin-manager` 行（`dsh --profile web --dump-config` 可见，未被 `disabled`）
+- 但 `@deepseek-ai/dsh-client-ui-plugin-manager` **未安装**：从 profile 解析得 `MODULE_NOT_FOUND`，且 `profiles/node_modules/@deepseek-ai/` 的 `client-ui-*` 列表中并无它——该 profile 的依赖是 0.1.5 时代装的，0.1.7 新增的这个包从未被装上
+- 因此 `plugins.bundle.config` 插槽在运行时**不存在**，`ctx.slots.inject` 会永久 pending，配置卡不渲染。**这是 mock 测试无法发现的**：mock 只验证代码调用了哪个插槽名，不验证插槽是否真的有人声明
+
+改用 `settings.plugins.tab`：由官方 `ui-settings-plugins` 在 **0.1.5 与 0.1.7 都声明**（该包在 profile 中已安装，其 bundle 含此插槽名），因此一次注册同时服务两版，配置卡成为 设置 → 插件 下的独立页签。这也让客户端少一条版本差异——插槽不再是变量，只剩 settings 服务绑定是变量。
+
+随之的调整：
+
+- 组件去掉 `view: 'summary' | 'page'` 分支（那是 `plugins.bundle.config` 的协议）；根元素由 `<li>` 改为 `<div>`（tab 面板无 `<ul>` 父级）；`open` 初始为 `true`（tab 正文即页面内容，默认折叠会把该页签唯一的内容藏起来）
+- 字典新增 `settingsTabLabel`（zh/en）
+- 客户端不再需要硬编码包名（`PACKAGE_NAME` 移除）；两条分支各自绑定 settings scope 后调用同一个 `registerSettingsTab(child)`
+- `compat-smoke.mjs` 断言改为：两版注册**同一**插槽、都不触碰任一版本专属插槽、注册项具备 list slot 的 id/order/label 且 label 走字典
+
+### 7.2 计划中的其它实现期修正
+
+- **`Config.toJSON()` 形状**：它返回扁平引用表 `{uid, refs}`，不是嵌套 `dict`。`settings-smoke.mjs` 的断言改走 `Config.dict`。
+- **volatile 的运行时效果**：`extra("volatile", true)` 在 schemastery 3.18.4（0.1.7）上会把解析结果变成 `Volatile<T>` 响应式包装（`{ get(), [cosmokit.volatile.write] }`），而在 3.18.2（0.1.5）上只是惰性 meta、输出仍是普通值。断言用 unwrap 辅助同时接受两种形状，使同一份 smoke 可在两版依赖下运行。
+- **rc1 smoke 的 mock**：计划给的 `list: async () => []` 会让枚举成为权威，从而按设计清掉先前用例累积的缓存会话，破坏该用例 `total === 4200` 的断言。改用一个**不含 `list`** 的真实 API 形状（`stat`）来测「无枚举」路径。
+- **Windows 路径**：`new URL(...).pathname` 在 Windows 上产生 `/D:/...`，再经 `pathToFileURL` 会得到 `D:\D:\...`。`compat-smoke.mjs` 改为直接 `import(new URL("../lib/client.js", import.meta.url).href)`。
+
+### 7.3 旁证
+
+本次调查在 DSH 启动日志中发现另一个第三方插件报出与根因 #1 完全相同的故障，佐证了诊断：
+
+```
+@goodandready/dsh-agent-loop-guard
+TypeError: sctx.settings.register is not a function
+  at lib/index.js:154
+```
