@@ -203,8 +203,15 @@ try {
 		throw new Error(`unexpected require: ${name}`);
 	});
 
-	check("client inject is the two-train intersection",
-		JSON.stringify(clientExports.inject) === JSON.stringify(["slots", "locale", "connection", "remote"]),
+	// DSH 0.2.0 dropped the `connection` and `remote` services, and a missing
+	// inject entry pins the whole fiber as pending — which is why the heatmap
+	// stopped rendering on 0.2.0-rc.2. `slots` and `locale` are the only
+	// services the client body touches, so the list is exactly those two.
+	check("client inject names only the services the body uses",
+		JSON.stringify(clientExports.inject) === JSON.stringify(["slots", "locale"]),
+		JSON.stringify(clientExports.inject));
+	check("client inject must NOT name services 0.2.0 removed",
+		!clientExports.inject.includes("connection") && !clientExports.inject.includes("remote"),
 		JSON.stringify(clientExports.inject));
 	check("client inject must NOT name settingsScope",
 		!clientExports.inject.includes("settingsScope"), JSON.stringify(clientExports.inject));
@@ -239,11 +246,15 @@ try {
 		![...ctxClient015.injectedSlots, ...ctxClient017.injectedSlots]
 			.some((n) => n === "settings.plugin.item" || n === "plugins.bundle.config" || n === "settings.plugins.tab"),
 		JSON.stringify([...ctxClient015.injectedSlots, ...ctxClient017.injectedSlots]));
-	check("dock registration keeps id/locale/order",
+	// The `locale` option was dropped in b941668: `tokenHeatmap` is not a
+	// built-in namespace, so 0.2.0's locale service only accepts the
+	// three-argument per-locale form and dictionary registration moved into a
+	// guarded effect. The dock entry keeps only id + order.
+	check("dock registration keeps id/order",
 		ctxClient015.registered.length === 1
 			&& ctxClient015.registered[0].options.id === "token-heatmap"
 			&& ctxClient015.registered[0].options.order === 10
-			&& ctxClient015.registered[0].options.locale === "tokenHeatmap",
+			&& ctxClient015.registered[0].options.locale === void 0,
 		JSON.stringify(ctxClient015.registered[0]?.options));
 } finally {
 	rmSync(home, { recursive: true, force: true });

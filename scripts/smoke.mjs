@@ -378,7 +378,10 @@ applyChild.slots = applyContext.slots;
 exports.apply(applyContext);
 check("apply registers the input-dock entry only", injectedSlots.length === 1 && injectedSlots[0] === "conversation.input.dock" && registeredSlots.length === 1, JSON.stringify({ injectedSlots, registeredSlots }));
 check("apply does NOT register into settings.plugin.item", registeredSlots.every((options) => options.name !== "settings.plugin.item"), JSON.stringify(registeredSlots));
-check("dock registration keeps id/locale/order", registeredSlots[0].id === "token-heatmap" && registeredSlots[0].locale === "tokenHeatmap" && registeredSlots[0].order === 10, JSON.stringify(registeredSlots[0]));
+// `locale` is deliberately absent: 0.2.0's locale service only accepts the
+// three-argument per-locale form, so dictionary registration moved into a
+// guarded effect and the dock entry keeps just id + order.
+check("dock registration keeps id/order", registeredSlots[0].id === "token-heatmap" && registeredSlots[0].locale === void 0 && registeredSlots[0].order === 10, JSON.stringify(registeredSlots[0]));
 check("settings scope still bound to token-heatmap", boundNamespace === "token-heatmap", String(boundNamespace));
 
 // ----------------------------------------------------------- server config route
